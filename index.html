@@ -22,6 +22,23 @@
         <!-- Filled by JS -->
     </div>
 
+    <!-- Flight mode UI -->
+    <button id="flyBtn"
+        class="fixed top-4 right-4 z-20 px-4 py-2 rounded-full bg-white/10 hover:bg-white/20 border border-white/20 text-sm tracking-widest uppercase backdrop-blur">
+        Fly — F
+    </button>
+    <div id="hud" class="hidden fixed inset-0 z-20 pointer-events-none">
+        <div class="absolute top-4 left-1/2 -translate-x-1/2 text-xs tracking-[0.3em] uppercase text-white/70">
+            Flight Mode
+        </div>
+        <div class="absolute bottom-4 left-1/2 -translate-x-1/2 text-[11px] text-white/60 text-center leading-relaxed">
+            <div>W / S — thrust   ·   A / D — yaw   ·   ↑ ↓ — pitch   ·   Q / E — roll</div>
+            <div>Space / Shift — boost / brake   ·   Mouse — look (click canvas)   ·   F or Esc — exit</div>
+        </div>
+        <!-- Crosshair -->
+        <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-6 h-6 border border-white/50 rounded-full"></div>
+    </div>
+
     <script type="module">
         import * as THREE from 'three';
 
@@ -524,6 +541,229 @@
         const nextPos = new THREE.Vector3();
         const nextLook = new THREE.Vector3();
 
+        // --- Collision colliders (sphere approximations) ---
+        const colliders = [];
+        colliders.push({ mesh: sun, radius: 8 });
+        for (const pl of planets) {
+            colliders.push({ mesh: pl.mesh, radius: pl.radius });
+            for (const m of pl.moons) colliders.push({ mesh: m.mesh, radius: m.mesh.geometry.parameters.radius });
+        }
+        for (const tgt of extraFocusTargets) {
+            colliders.push({ mesh: tgt.mesh, radius: tgt.radius });
+        }
+        const SHIP_RADIUS = 1.1;
+
+        // --- Spaceship + flight controls ---
+        // Procedural hull texture: subtle panel lines + rivets baked into canvas.
+        function makeHullTexture() {
+            const w = 512, h = 256;
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            const ctx = c.getContext('2d');
+            // Brushed metal base
+            const grad = ctx.createLinearGradient(0, 0, 0, h);
+            grad.addColorStop(0, '#c8ced6');
+            grad.addColorStop(0.5, '#9aa3ad');
+            grad.addColorStop(1, '#6d747c');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, w, h);
+            // Fine horizontal brush noise
+            for (let i = 0; i < 6000; i++) {
+                ctx.fillStyle = `rgba(255,255,255,${Math.random() * 0.04})`;
+                ctx.fillRect(Math.random() * w, Math.random() * h, 2 + Math.random() * 6, 1);
+            }
+            // Panel lines
+            ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+            ctx.lineWidth = 1;
+            for (let x = 0; x < w; x += 64) {
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+            }
+            for (let y = 0; y < h; y += 48) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+            }
+            // Rivets
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            for (let x = 8; x < w; x += 16) {
+                for (let y = 8; y < h; y += 48) {
+                    ctx.beginPath(); ctx.arc(x, y, 1.1, 0, Math.PI * 2); ctx.fill();
+                }
+            }
+            // Accent stripe
+            ctx.fillStyle = '#e23a3a';
+            ctx.fillRect(0, h * 0.42, w, 6);
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fillRect(0, h * 0.42 + 6, w, 2);
+            const tex = new THREE.CanvasTexture(c);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.anisotropy = 8;
+            return tex;
+        }
+        const hullTex = makeHullTexture();
+
+        const ship = new THREE.Group();
+
+        // Fuselage (capsule along -Z forward)
+        const fuselage = new THREE.Mesh(
+            new THREE.CapsuleGeometry(0.32, 1.4, 8, 16),
+            new THREE.MeshStandardMaterial({
+                map: hullTex, metalness: 0.85, roughness: 0.35, envMapIntensity: 1
+            })
+        );
+        fuselage.rotation.x = Math.PI / 2;
+        ship.add(fuselage);
+
+        // Nose cone
+        const nose = new THREE.Mesh(
+            new THREE.ConeGeometry(0.32, 0.7, 16),
+            new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0.6, roughness: 0.4 })
+        );
+        nose.rotation.x = -Math.PI / 2;
+        nose.position.z = -1.2;
+        ship.add(nose);
+
+        // Cockpit (tinted glass dome)
+        const cockpit = new THREE.Mesh(
+            new THREE.SphereGeometry(0.28, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2),
+            new THREE.MeshPhysicalMaterial({
+                color: 0x66ccff, metalness: 0.1, roughness: 0.05,
+                transmission: 0.6, transparent: true, opacity: 0.85,
+                clearcoat: 1, clearcoatRoughness: 0.05
+            })
+        );
+        cockpit.position.set(0, 0.18, -0.35);
+        ship.add(cockpit);
+
+        // Swept wings (horizontal, extending laterally; root at fuselage, tip swept back)
+        const wingShape = new THREE.Shape();
+        wingShape.moveTo(0, 0);            // root leading edge
+        wingShape.lineTo(0, 0.9);          // root trailing edge
+        wingShape.lineTo(1.4, 1.1);        // tip trailing edge
+        wingShape.lineTo(1.4, 0.55);       // tip leading edge
+        wingShape.lineTo(0, 0);
+        const wingGeo = new THREE.ExtrudeGeometry(wingShape, { depth: 0.05, bevelEnabled: false });
+        const wingMat = new THREE.MeshStandardMaterial({
+            map: hullTex, metalness: 0.8, roughness: 0.4
+        });
+        const wingR = new THREE.Mesh(wingGeo, wingMat);
+        // Lay flat in the XZ plane so the wing is horizontal (shape Y -> +Z = aft)
+        wingR.rotation.x = Math.PI / 2;
+        wingR.position.set(0.28, -0.02, -0.25);
+        ship.add(wingR);
+        const wingL = wingR.clone();
+        wingL.scale.x = -1;
+        wingL.position.x = -0.28;
+        ship.add(wingL);
+
+        // Vertical tail fin (sits on top of the tail, extends backward)
+        const finShape = new THREE.Shape();
+        finShape.moveTo(0, 0);             // base front
+        finShape.lineTo(0.75, 0);          // base back
+        finShape.lineTo(0.6, 0.65);        // top back
+        finShape.lineTo(0.1, 0.55);        // top front
+        finShape.lineTo(0, 0);
+        const fin = new THREE.Mesh(
+            new THREE.ExtrudeGeometry(finShape, { depth: 0.04, bevelEnabled: false }),
+            wingMat
+        );
+        // Rotate so the shape's X maps to +Z (toward the tail) and Y stays up
+        fin.rotation.y = -Math.PI / 2;
+        fin.position.set(-0.02, 0.18, 0.1);
+        ship.add(fin);
+
+        // Twin engines + glow
+        const engineMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0.9, roughness: 0.3 });
+        const makeEngine = (x) => {
+            const g = new THREE.Group();
+            const housing = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.18, 0.45, 16), engineMat);
+            housing.rotation.x = Math.PI / 2;
+            g.add(housing);
+            const glowMesh = new THREE.Mesh(
+                new THREE.SphereGeometry(0.14, 16, 16),
+                new THREE.MeshBasicMaterial({ color: 0x66ddff })
+            );
+            glowMesh.position.z = 0.22;
+            g.add(glowMesh);
+            const glowSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+                map: glowTex, color: 0x66ddff, transparent: true,
+                blending: THREE.AdditiveBlending, depthWrite: false
+            }));
+            glowSprite.scale.set(1.2, 1.2, 1);
+            glowSprite.position.z = 0.35;
+            g.add(glowSprite);
+            g.position.set(x, -0.05, 0.85);
+            ship.add(g);
+            return { group: g, glowMesh, glowSprite };
+        };
+        const engineR = makeEngine(0.32);
+        const engineL = makeEngine(-0.32);
+        const engineGlows = [engineR, engineL];
+
+        // Start parked near Earth's orbit
+        ship.position.set(25, 3, 6);
+        ship.lookAt(0, 0, 0);
+        scene.add(ship);
+
+        // Restore ship transform from localStorage
+        try {
+            const saved = JSON.parse(localStorage.getItem('universe.ship') || 'null');
+            if (saved && saved.p && saved.q) {
+                ship.position.fromArray(saved.p);
+                ship.quaternion.fromArray(saved.q);
+            }
+        } catch {}
+        function saveShip() {
+            try {
+                localStorage.setItem('universe.ship', JSON.stringify({
+                    p: ship.position.toArray(),
+                    q: ship.quaternion.toArray()
+                }));
+            } catch {}
+        }
+        let lastShipSave = 0;
+        window.addEventListener('beforeunload', saveShip);
+
+        const keys = Object.create(null);
+        let flightMode = false;
+        let yawV = 0, pitchV = 0;
+        const shipVelocity = new THREE.Vector3();
+        const flyBtn = document.getElementById('flyBtn');
+        const hud = document.getElementById('hud');
+
+        function setFlightMode(on, { fromUser = true } = {}) {
+            flightMode = on;
+            hud.classList.toggle('hidden', !on);
+            sectionsEl.classList.toggle('hidden', on);
+            hint.classList.toggle('hidden', on);
+            document.body.style.overflow = on ? 'hidden' : '';
+            flyBtn.textContent = on ? 'Exit — F' : 'Fly — F';
+            try { localStorage.setItem('universe.mode', on ? 'flight' : 'scroll'); } catch {}
+            if (!on) saveShip();
+            if (on && fromUser) {
+                canvas.requestPointerLock?.();
+            } else if (!on && document.pointerLockElement) {
+                document.exitPointerLock();
+            }
+        }
+        // Restore last mode (pointer lock needs a user gesture, so just set state).
+        try {
+            if (localStorage.getItem('universe.mode') === 'flight') {
+                setFlightMode(true, { fromUser: false });
+            }
+        } catch {}
+        flyBtn.addEventListener('click', () => setFlightMode(!flightMode));
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'KeyF') { setFlightMode(!flightMode); return; }
+            if (e.code === 'Escape' && flightMode) { setFlightMode(false); return; }
+            keys[e.code] = true;
+        });
+        window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+        canvas.addEventListener('mousemove', (e) => {
+            if (!flightMode || document.pointerLockElement !== canvas) return;
+            yawV   += -e.movementX * 0.0015;
+            pitchV += -e.movementY * 0.0015;
+        });
+
         const clock = new THREE.Clock();
         function animate() {
             requestAnimationFrame(animate);
@@ -567,24 +807,111 @@
             }
 
             // Compute camera target from scroll position
-            const maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
-            const progress = Math.min(1, Math.max(0, window.scrollY / maxScroll)) * (focusTargets.length - 1);
-            const idx = Math.floor(progress);
-            const frac = progress - idx;
-            const a = focusTargets[idx];
-            const b = focusTargets[Math.min(focusTargets.length - 1, idx + 1)];
-            getFocus(a, segPos, segLook);
-            getFocus(b, nextPos, nextLook);
-            // Smoothstep blend between sections
-            const s = frac * frac * (3 - 2 * frac);
-            targetPos.lerpVectors(segPos, nextPos, s);
-            targetLook.lerpVectors(segLook, nextLook, s);
+            if (flightMode) {
+                // --- Ship update ---
+                // Rotational input (keys + accumulated mouse delta)
+                const rotSpeed = 0.025;
+                if (keys['KeyA']) yawV   += rotSpeed * 0.6;
+                if (keys['KeyD']) yawV   -= rotSpeed * 0.6;
+                if (keys['ArrowUp'])   pitchV += rotSpeed * 0.6;
+                if (keys['ArrowDown']) pitchV -= rotSpeed * 0.6;
+                let rollV = 0;
+                if (keys['KeyQ']) rollV += rotSpeed;
+                if (keys['KeyE']) rollV -= rotSpeed;
+                ship.rotateY(yawV);
+                ship.rotateX(pitchV);
+                ship.rotateZ(rollV);
+                yawV *= 0.85; pitchV *= 0.85;
 
-            // Damp toward target each frame
-            camPos.lerp(targetPos, 0.08);
-            camLook.lerp(targetLook, 0.12);
-            camera.position.copy(camPos);
-            camera.lookAt(camLook);
+                // Thrust along ship's local -Z (forward)
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
+                let thrust = 0;
+                if (keys['KeyW']) thrust += 1;
+                if (keys['KeyS']) thrust -= 0.6;
+                const boost = keys['Space'] ? 4 : 1;
+                shipVelocity.addScaledVector(forward, thrust * 0.05 * boost);
+                if (keys['ShiftLeft'] || keys['ShiftRight']) shipVelocity.multiplyScalar(0.9);
+                shipVelocity.multiplyScalar(0.985); // gentle damping
+                ship.position.add(shipVelocity);
+
+                // Collision resolution: keep ship outside every body's sphere.
+                const cTmp = new THREE.Vector3();
+                const nTmp = new THREE.Vector3();
+                for (const c of colliders) {
+                    c.mesh.getWorldPosition(cTmp);
+                    const minDist = c.radius + SHIP_RADIUS;
+                    const d = ship.position.distanceTo(cTmp);
+                    if (d < minDist) {
+                        nTmp.subVectors(ship.position, cTmp).normalize();
+                        ship.position.copy(cTmp).addScaledVector(nTmp, minDist + 0.01);
+                        // Remove inward velocity component; keep tangential, with energy loss.
+                        const vDotN = shipVelocity.dot(nTmp);
+                        if (vDotN < 0) shipVelocity.addScaledVector(nTmp, -vDotN * 1.6);
+                        shipVelocity.multiplyScalar(0.7);
+                    }
+                }
+
+                // Engine glow pulses with thrust
+                const glowScale = 1 + Math.min(2.5, shipVelocity.length() * 4);
+                for (const eg of engineGlows) {
+                    eg.glowMesh.scale.setScalar(glowScale);
+                    eg.glowSprite.scale.setScalar(1.2 * glowScale);
+                }
+
+                // --- Chase camera ---
+                // Pull back further & punch FOV when going fast for a speed feel.
+                const speed = shipVelocity.length();
+                const speedT = Math.min(1, speed / 0.5);
+                const baseOffset = new THREE.Vector3(0, 1.0, 4.0 + speedT * 2.0);
+                const camOffset = baseOffset.applyQuaternion(ship.quaternion);
+                targetPos.copy(ship.position).add(camOffset);
+                // Look slightly ahead of the ship for a leading shot.
+                targetLook.copy(ship.position).addScaledVector(forward, 6 + speedT * 4);
+
+                // Frame-rate independent smoothing
+                const dt = Math.min(0.05, clock.getDelta());
+                const posK = 1 - Math.exp(-dt * 8);   // ~8 = position responsiveness
+                const lookK = 1 - Math.exp(-dt * 12); // ~12 = aim responsiveness
+                camPos.lerp(targetPos, posK);
+                camLook.lerp(targetLook, lookK);
+
+                // Smoothly blend camera "up" toward ship up so roll feels natural
+                // without instantly snapping when the ship banks.
+                const shipUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
+                camera.up.lerp(shipUp, 1 - Math.exp(-dt * 6)).normalize();
+
+                camera.position.copy(camPos);
+                camera.lookAt(camLook);
+
+                // FOV punch on boost
+                const targetFov = 60 + speedT * 18;
+                camera.fov += (targetFov - camera.fov) * (1 - Math.exp(-dt * 5));
+                camera.updateProjectionMatrix();
+
+                // Throttled persistence of ship transform
+                if (t - lastShipSave > 1) { saveShip(); lastShipSave = t; }
+            } else {
+                const maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+                const progress = Math.min(1, Math.max(0, window.scrollY / maxScroll)) * (focusTargets.length - 1);
+                const idx = Math.floor(progress);
+                const frac = progress - idx;
+                const a = focusTargets[idx];
+                const b = focusTargets[Math.min(focusTargets.length - 1, idx + 1)];
+                getFocus(a, segPos, segLook);
+                getFocus(b, nextPos, nextLook);
+                // Smoothstep blend between sections
+                const s = frac * frac * (3 - 2 * frac);
+                targetPos.lerpVectors(segPos, nextPos, s);
+                targetLook.lerpVectors(segLook, nextLook, s);
+
+                // Damp toward target each frame
+                camPos.lerp(targetPos, 0.08);
+                camLook.lerp(targetLook, 0.12);
+                camera.position.copy(camPos);
+                camera.up.set(0, 1, 0);
+                camera.lookAt(camLook);
+                if (camera.fov !== 60) { camera.fov = 60; camera.updateProjectionMatrix(); }
+            }
 
             renderer.render(scene, camera);
         }
